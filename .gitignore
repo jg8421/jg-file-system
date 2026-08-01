@@ -1,0 +1,5 @@
+__pycache__/
+preview_cache/
+settings.json
+*.FileWorkbench-backup-*
+*.lnk
