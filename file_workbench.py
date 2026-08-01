@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import zipfile
+from ctypes import wintypes
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y, filedialog, messagebox, simpledialog, ttk
 import tkinter as tk
@@ -30,7 +31,7 @@ import markdown
 from tkinterweb import HtmlFrame
 
 
-OFFICE_EXTENSIONS = {".doc", ".docx", ".xlsx", ".xlsm", ".pptx"}
+OFFICE_EXTENSIONS = {".doc", ".docx", ".xlsx", ".xlsm", ".ppt", ".pptx"}
 PREVIEWABLE_TEXT = {".txt", ".md", ".csv", ".py", ".ps1", ".json", ".html", ".xml"}
 SEARCHABLE_CONTENT_EXTENSIONS = PREVIEWABLE_TEXT | {".pdf", ".docx"}
 MAX_SEARCH_FILE_BYTES = 25 * 1024 * 1024
@@ -44,9 +45,11 @@ PREVIEW_CACHE = Path(__file__).with_name("preview_cache")
 OFFICE_RENDER_SCRIPT = Path(__file__).with_name("render_office_preview.ps1")
 EXCEL_EDIT_SCRIPT = Path(__file__).with_name("edit_excel_cell.ps1")
 APP_ICON_PATH = Path(__file__).with_name("file_workbench.ico")
-MAX_PREVIEW_PAGES = 4
-MAX_PPT_PREVIEW_SLIDES = 8
-PREVIEW_RASTER_SCALE = 1.5
+NATIVE_PDF_PREVIEW = Path(__file__).with_name("native_pdf_preview.exe")
+# Show a useful continuous reading window by default.  The cache is deliberately
+# large, so reopening a long document stays fast after its first render.
+MAX_PREVIEW_PAGES = 16
+PREVIEW_RASTER_SCALE = 2.0
 PREVIEW_CACHE_LIMIT = 5 * 1024 * 1024 * 1024
 PREVIEW_CACHE_TARGET = 4 * 1024 * 1024 * 1024
 PV_WORKING_ROOT = Path.home() / "Documents" / "【PV Working】"
@@ -323,39 +326,74 @@ def cleanup_preview_cache() -> None:
 
 def render_office_first_page(path: Path) -> Image.Image | None:
     suffix = path.suffix.lower()
-    if suffix in {".doc", ".docx"}:
+    if suffix in {".doc", ".docx", ".ppt", ".pptx"}:
         rendered_pdf = cached_path(path, ".pdf")
+        if rendered_pdf.exists():
+            # A leftover partial/corrupt render would poison the preview cache.
+            try:
+                with fitz.open(rendered_pdf) as document:
+                    if document.page_count < 1:
+                        raise ValueError("empty PDF")
+            except Exception:
+                try:
+                    rendered_pdf.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if not rendered_pdf.exists():
+            kind = "word" if suffix in {".doc", ".docx"} else "powerpoint"
             run_office_renderer(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(OFFICE_RENDER_SCRIPT), "-Source", str(path), "-Output", str(rendered_pdf), "-Kind", "word"],
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(OFFICE_RENDER_SCRIPT), "-Source", str(path), "-Output", str(rendered_pdf), "-Kind", kind],
             )
         return render_pdf_pages(rendered_pdf)
-    if suffix == ".pptx":
-        rendered_dir = cached_path(path, ".slides-1080p")
-        first_slide = rendered_dir / "Slide1.PNG"
-        if not first_slide.exists():
-            run_office_renderer(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(OFFICE_RENDER_SCRIPT), "-Source", str(path), "-Output", str(rendered_dir), "-Kind", "powerpoint"],
-            )
-        cached = cached_path(path, ".slides-1080p.png")
-        if cached.exists():
-            return Image.open(cached).copy()
-        slides = sorted(rendered_dir.glob("Slide*.PNG"), key=lambda item: int(re.search(r"(\d+)", item.stem).group(1)))
-        pages = [Image.open(slide).copy() for slide in slides[:MAX_PPT_PREVIEW_SLIDES]]
-        if not pages:
-            return None
-        image = stitch_pages(pages)
-        image.save(cached, "PNG")
-        cleanup_preview_cache()
-        return image
     return None
 
 
 def run_office_renderer(command: list[str]) -> None:
-    options: dict[str, object] = {"check": True, "capture_output": True, "text": True, "timeout": 45}
+    options: dict[str, object] = {"check": True, "capture_output": True, "text": True, "timeout": 90}
     if os.name == "nt":
         options["creationflags"] = subprocess.CREATE_NO_WINDOW
-    subprocess.run(command, **options)
+    before = office_process_ids()
+    try:
+        subprocess.run(command, **options)
+    except Exception:
+        # Remove the partial output PDF so a broken render is never served as valid.
+        for argument in command:
+            if isinstance(argument, str) and argument.lower().endswith(".pdf"):
+                try:
+                    Path(argument).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        kill_new_office_processes(before)
+        raise
+
+
+def office_process_ids() -> set[int]:
+    """PIDs of running Word/PowerPoint processes (best effort, Windows only)."""
+    if os.name != "nt":
+        return set()
+    ids: set[int] = set()
+    for image in ("WINWORD.EXE", "POWERPNT.EXE"):
+        try:
+            output = subprocess.run(
+                ["tasklist.exe", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in output.splitlines():
+            parts = line.replace('"', "").split(",")
+            if len(parts) >= 2 and parts[0].upper() == image and parts[1].isdigit():
+                ids.add(int(parts[1]))
+    return ids
+
+
+def kill_new_office_processes(before: set[int]) -> None:
+    """Kill Word/PowerPoint processes that appeared since a render started."""
+    for pid in office_process_ids() - before:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
 
 
 def excel_color(color: object, default: str) -> str:
@@ -434,6 +472,8 @@ class FileWorkbench(tk.Tk):
         self.preview_token = 0
         self.previewed_path: Path | None = None
         self.preview_pdf_path: Path | None = None
+        self.native_preview_process: subprocess.Popen[bytes] | None = None
+        self.native_preview_path: Path | None = None
         self.pdf_zoom_generation = 0
         self.inline_markdown_path: Path | None = None
         self.preview_font_size = 14
@@ -569,6 +609,7 @@ class FileWorkbench(tk.Tk):
         self.preview_host.pack(fill=BOTH, expand=True, pady=(8, 0))
         self.preview = tk.Text(self.preview_host, wrap="word", font=("Microsoft YaHei", self.preview_font_size), padx=18, pady=16, state="disabled")
         self.preview_canvas = tk.Canvas(self.preview_host, highlightthickness=0, background="white")
+        self.native_preview_host = tk.Frame(self.preview_host, background="white", highlightthickness=0)
         self.markdown_view = HtmlFrame(self.preview_host, messages_enabled=False, vertical_scrollbar=True, horizontal_scrollbar=False, stylesheets_enabled=True)
         self.excel_stack = ttk.Frame(self.preview_host)
         self.excel_content = ttk.Frame(self.excel_stack)
@@ -1149,23 +1190,101 @@ class FileWorkbench(tk.Tk):
         self.inline_markdown_path = None
         self.save_markdown_button.pack_forget()
         if path.is_dir():
+            self.stop_native_pdf_preview()
             self.previewed_path = None
             self.preview_pdf_path = None
             self.preview_title.set(path.name or str(path))
             self.preview_text(self.folder_preview(path))
             return
+        if path.suffix.lower() != ".pdf":
+            self.stop_native_pdf_preview()
         self.preview_token += 1
         token = self.preview_token
         self.previewed_path = path
-        self.preview_pdf_path = path if path.suffix.lower() == ".pdf" else None
+        self.preview_pdf_path = path if path.suffix.lower() == ".pdf" else (
+            cached_path(path, ".pdf") if path.suffix.lower() in {".doc", ".docx", ".ppt", ".pptx"} else None
+        )
         self.preview_title.set(path.name)
         self.preview_text("Loading local preview...")
+        if path.suffix.lower() == ".pdf" and NATIVE_PDF_PREVIEW.exists():
+            self.after(20, lambda selected=path, selected_token=token: self.start_native_pdf_preview(selected, selected_token))
+            return
         with self.preview_lock:
             self.preview_request = (path, token)
             if self.preview_worker_running:
                 return
             self.preview_worker_running = True
         threading.Thread(target=self.preview_worker, daemon=True).start()
+
+    def stop_native_pdf_preview(self) -> None:
+        self.native_preview_host.pack_forget()
+        process = self.native_preview_process
+        self.native_preview_process = None
+        self.native_preview_path = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=0.4)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+
+    def start_native_pdf_preview(self, path: Path, token: int) -> None:
+        if token != self.preview_token or not path.is_file() or not NATIVE_PDF_PREVIEW.exists():
+            return
+        if self.native_preview_process and self.native_preview_process.poll() is None:
+            if self.send_native_pdf_path(path):
+                self.native_preview_path = path
+                self.status.set("Native PDF preview | instant switch | selectable text, continuous scroll, Ctrl+wheel zoom")
+                return
+        self.stop_native_pdf_preview()
+        self.preview.pack_forget()
+        self.preview_canvas.pack_forget()
+        self.excel_stack.pack_forget()
+        self.markdown_view.pack_forget()
+        self.preview_scroll.pack_forget()
+        self.native_preview_host.pack(fill=BOTH, expand=True)
+        self.update_idletasks()
+        options: dict[str, object] = {"cwd": str(NATIVE_PDF_PREVIEW.parent)}
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            self.native_preview_process = subprocess.Popen(
+                [str(NATIVE_PDF_PREVIEW), str(self.native_preview_host.winfo_id()), str(path)],
+                **options,
+            )
+            self.native_preview_path = path
+            self.status.set("Native PDF preview | selectable text, continuous scroll, Ctrl+wheel zoom")
+        except OSError as exc:
+            self.native_preview_host.pack_forget()
+            self.preview_text(f"Native PDF preview unavailable: {exc}")
+
+    def send_native_pdf_path(self, path: Path) -> bool:
+        if os.name != "nt":
+            return False
+        pipe_name = rf"\\.\pipe\FileWorkbenchPdfPreview-{self.native_preview_host.winfo_id()}"
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+        kernel32.WaitNamedPipeW.restype = wintypes.BOOL
+        kernel32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        kernel32.WriteFile.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        if not kernel32.WaitNamedPipeW(pipe_name, 250):
+            return False
+        handle = kernel32.CreateFileW(pipe_name, 0x40000000, 0, None, 3, 0, None)
+        if handle == ctypes.c_void_p(-1).value:
+            return False
+        payload = str(path).encode("utf-8")
+        written = wintypes.DWORD()
+        try:
+            return bool(kernel32.WriteFile(handle, payload, len(payload), ctypes.byref(written), None))
+        finally:
+            kernel32.CloseHandle(handle)
 
     def preview_worker(self) -> None:
         while True:
@@ -1200,15 +1319,21 @@ class FileWorkbench(tk.Tk):
             if path.suffix.lower() in {".xlsx", ".xlsm"}:
                 self.preview_jobs.put((token, "excel", excel_workbook_grid(path)))
                 return
-            if path.suffix.lower() in {".doc", ".docx", ".pptx"}:
+            if path.suffix.lower() in {".doc", ".docx", ".ppt", ".pptx"}:
                 thumbnail = embedded_office_thumbnail(path)
                 if thumbnail is not None:
                     self.preview_jobs.put((token, "image", thumbnail))
                 if not self.preview_is_current(token):
                     return
-                rendered = render_office_first_page(path)
+                try:
+                    rendered = render_office_first_page(path)
+                except Exception:
+                    rendered = None  # Fall back to the plain text preview below.
                 if rendered is not None:
                     self.preview_jobs.put((token, "image", rendered))
+                rendered_pdf = cached_path(path, ".pdf")
+                if rendered_pdf.exists():
+                    self.preview_jobs.put((token, "native_pdf", rendered_pdf))
                     return
             thumbnail = embedded_office_thumbnail(path) if path.suffix.lower() in OFFICE_EXTENSIONS else None
             if thumbnail is not None:
@@ -1235,6 +1360,8 @@ class FileWorkbench(tk.Tk):
                         self.preview_excel(content)
                     elif kind == "markdown":
                         self.preview_markdown(str(content))
+                    elif kind == "native_pdf":
+                        self.start_native_pdf_preview(Path(str(content)), token)
                     else:
                         self.preview_text(str(content))
         except queue.Empty:
@@ -1242,6 +1369,7 @@ class FileWorkbench(tk.Tk):
         self.after(120, self.poll_preview)
 
     def preview_text(self, content: str) -> None:
+        self.native_preview_host.pack_forget()
         self.preview_canvas.pack_forget()
         self.excel_stack.pack_forget()
         self.markdown_view.pack_forget()
@@ -1258,6 +1386,7 @@ class FileWorkbench(tk.Tk):
             self.preview_text("Preview image unavailable.")
             return
         self.preview.pack_forget()
+        self.native_preview_host.pack_forget()
         self.excel_stack.pack_forget()
         self.markdown_view.pack_forget()
         self.preview_canvas.pack(side=LEFT, fill=BOTH, expand=True)
@@ -1300,7 +1429,7 @@ class FileWorkbench(tk.Tk):
             self.pdf_zoom_generation += 1
             generation = self.pdf_zoom_generation
             scale = min(5.0, max(2.0, 1.8 * self.preview_zoom))
-            page_limit = MAX_PREVIEW_PAGES if self.preview_zoom <= 1.25 else (4 if self.preview_zoom <= 2.2 else 2)
+            page_limit = MAX_PREVIEW_PAGES if self.preview_zoom <= 1.25 else (8 if self.preview_zoom <= 2.2 else 4)
             threading.Thread(
                 target=self.build_zoomed_pdf_preview,
                 args=(self.preview_pdf_path, self.preview_token, generation, scale, page_limit),
@@ -1350,6 +1479,7 @@ class FileWorkbench(tk.Tk):
             return
         self.preview_title.set(f"{self.selected_path().name if self.selected_path() else 'Workbook'} | Sheets")
         self.preview.pack_forget()
+        self.native_preview_host.pack_forget()
         self.preview_canvas.pack_forget()
         self.markdown_view.pack_forget()
         self.preview_scroll.pack_forget()
@@ -1426,6 +1556,7 @@ class FileWorkbench(tk.Tk):
 
     def preview_markdown(self, source: str) -> None:
         self.preview.pack_forget()
+        self.native_preview_host.pack_forget()
         self.preview_canvas.pack_forget()
         self.excel_stack.pack_forget()
         self.preview_scroll.pack_forget()
@@ -1444,6 +1575,7 @@ class FileWorkbench(tk.Tk):
             messagebox.showerror("Cannot open Markdown", str(exc))
             return
         self.inline_markdown_path = path
+        self.stop_native_pdf_preview()
         self.preview_canvas.pack_forget()
         self.excel_stack.pack_forget()
         self.markdown_view.pack_forget()
