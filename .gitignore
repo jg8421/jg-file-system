@@ -6,3 +6,9 @@ settings.json
 webview2/
 webview2.zip
 native_pdf_preview.exe.WebView2/
+
+build/
+release/
+WeChatChatExport/
+selftest.log
+

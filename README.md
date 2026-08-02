@@ -2,6 +2,14 @@
 
 Windows local file workbench for navigating folders, previewing Office documents, searching project files, and managing common file operations.
 
+## v1.2 Highlights
+
+- **MSG email preview:** open Outlook `.msg` files directly — subject, sender, recipients, attachments, and body text are extracted locally (no Outlook needed).
+- **Zip archive preview:** click a `.zip` to browse its contents as a clickable list; click any entry to preview it inline (text, images, Office files, PDFs, and more).
+- **Arrow-key file switching:** Up/Down keep moving between files even while the preview pane is focused, so previewing no longer traps keyboard navigation.
+- **Faster previews:** images and zip listings appear instantly; Excel, Word, and PowerPoint show quick text/thumbnail first and upgrade to full quality in the background; cache cleanup no longer blocks startup.
+- **Bigger Markdown reading:** Markdown preview uses a 20px font, fuller window width, and relaxed line spacing by default; Ctrl+Plus / Ctrl+Minus still adjust reading size.
+
 ## v1.1 Highlights
 
 - **Native PDF preview:** embedded Microsoft Edge WebView2 for smooth continuous scrolling, text selection/copy, search, and browser-quality zoom.
@@ -14,4 +22,5 @@ Windows local file workbench for navigating folders, previewing Office documents
 
 ## Run
 
-Open `Launch File Workbench.cmd` on Windows with Python 3.12 and Microsoft Office installed for Office rendering and Excel cell editing.
+- **Release EXE:** open `release\FileWorkbench v1.2\FileWorkbench.exe` — portable, no Python needed.
+- **From source:** open `Launch File Workbench.cmd` on Windows with Python 3.12 and Microsoft Office installed for Office rendering and Excel cell editing.

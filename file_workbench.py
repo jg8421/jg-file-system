@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import io
+from html import escape
 import hashlib
 import ctypes
 import os
@@ -29,23 +30,35 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 import markdown
 from tkinterweb import HtmlFrame
+from msg_reader import MsgReader
 
 
 OFFICE_EXTENSIONS = {".doc", ".docx", ".xlsx", ".xlsm", ".ppt", ".pptx"}
+MSG_EXTENSIONS = {".msg"}
+ZIP_EXTENSIONS = {".zip"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff"}
 PREVIEWABLE_TEXT = {".txt", ".md", ".csv", ".py", ".ps1", ".json", ".html", ".xml"}
-SEARCHABLE_CONTENT_EXTENSIONS = PREVIEWABLE_TEXT | {".pdf", ".docx"}
+SEARCHABLE_CONTENT_EXTENSIONS = PREVIEWABLE_TEXT | {".pdf", ".docx", ".msg"}
 MAX_SEARCH_FILE_BYTES = 25 * 1024 * 1024
 MAX_SEARCH_TEXT_CHARS = 60_000
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_CACHE_ENTRIES = 400
 MAX_SEARCH_FILES = 20_000
 MAX_TEXT = 250_000
-SETTINGS_PATH = Path(__file__).with_name("settings.json")
-PREVIEW_CACHE = Path(__file__).with_name("preview_cache")
-OFFICE_RENDER_SCRIPT = Path(__file__).with_name("render_office_preview.ps1")
-EXCEL_EDIT_SCRIPT = Path(__file__).with_name("edit_excel_cell.ps1")
-APP_ICON_PATH = Path(__file__).with_name("file_workbench.ico")
-NATIVE_PDF_PREVIEW = Path(__file__).with_name("native_pdf_preview.exe")
+if getattr(sys, "frozen", False):
+    # User data (settings/cache) lives next to the EXE; bundled helpers live in
+    # the _internal bundle directory that PyInstaller exposes via sys._MEIPASS.
+    BASE_DIR = Path(sys.executable).resolve().parent
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR)).resolve()
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+    BUNDLE_DIR = BASE_DIR
+SETTINGS_PATH = BASE_DIR / "settings.json"
+PREVIEW_CACHE = BASE_DIR / "preview_cache"
+OFFICE_RENDER_SCRIPT = BUNDLE_DIR / "render_office_preview.ps1"
+EXCEL_EDIT_SCRIPT = BUNDLE_DIR / "edit_excel_cell.ps1"
+APP_ICON_PATH = BUNDLE_DIR / "file_workbench.ico"
+NATIVE_PDF_PREVIEW = BUNDLE_DIR / "native_pdf_preview.exe"
 # Show a useful continuous reading window by default.  The cache is deliberately
 # large, so reopening a long document stays fast after its first render.
 MAX_PREVIEW_PAGES = 16
@@ -194,7 +207,10 @@ def office_text(path: Path) -> str:
 
 
 def text_preview(path: Path) -> str:
+    path = Path(path)
     suffix = path.suffix.lower()
+    if suffix in MSG_EXTENSIONS:
+        return MsgReader(path).preview_text()
     if suffix in OFFICE_EXTENSIONS:
         return office_text(path)
     if suffix in PREVIEWABLE_TEXT:
@@ -210,7 +226,7 @@ def text_preview(path: Path) -> str:
 def markdown_html(source: str) -> str:
     body = markdown.markdown(source, extensions=["extra", "tables", "fenced_code", "sane_lists", "nl2br"])
     return """<!doctype html><html><head><meta charset='utf-8'><style>
-    body { font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif; font-weight: 400; letter-spacing: 0; color: #171717; background: #ffffff; max-width: 980px; margin: 24px auto 60px; padding: 0 32px; font-size: 18px; line-height: 1.85; }
+    body { font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif; font-weight: 400; letter-spacing: 0.2px; color: #171717; background: #ffffff; max-width: 100%; margin: 20px 8px 60px; padding: 0 22px; font-size: 20px; line-height: 1.9; }
     h1,h2,h3 { color: #0f172a; line-height: 1.3; margin-top: 1.6em; } h1 { font-size: 2em; border-bottom: 1px solid #e2e8f0; padding-bottom: .35em; } h2 { font-size: 1.5em; }
     code { font-family: Consolas, monospace; background: #f1f5f9; padding: 2px 5px; border-radius: 4px; } pre { background: #0f172a; color: #e2e8f0; padding: 16px; border-radius: 8px; overflow-x: auto; } pre code { background: transparent; color: inherit; padding: 0; }
     blockquote { border-left: 4px solid #60a5fa; margin: 1em 0; padding: .2em 1em; color: #475569; background: #f8fafc; } table { border-collapse: collapse; width: 100%; margin: 1em 0; } th,td { border: 1px solid #cbd5e1; padding: 8px 10px; text-align: left; } th { background: #eff6ff; } a { color: #2563eb; }
@@ -219,6 +235,7 @@ def markdown_html(source: str) -> str:
 
 def search_document_text(path: Path) -> str:
     """Extract a deliberately small searchable text slice for responsive local search."""
+    path = Path(path)
     suffix = path.suffix.lower()
     if suffix in PREVIEWABLE_TEXT:
         return path.read_text(encoding="utf-8", errors="replace")[:MAX_SEARCH_TEXT_CHARS].lower()
@@ -229,6 +246,8 @@ def search_document_text(path: Path) -> str:
     if suffix == ".pdf":
         with fitz.open(path) as document:
             return " ".join(document.load_page(index).get_text() for index in range(min(3, document.page_count))).lower()[:MAX_SEARCH_TEXT_CHARS]
+    if suffix == ".msg":
+        return MsgReader(path).preview_text().lower()[:MAX_SEARCH_TEXT_CHARS]
     return ""
 
 
@@ -456,7 +475,7 @@ class FileWorkbench(tk.Tk):
         self.minsize(1180, 760)
         self.state("zoomed")
         self.settings = load_settings()
-        cleanup_preview_cache()
+        threading.Thread(target=cleanup_preview_cache, daemon=True).start()
         previous = Path(str(self.settings.get("last_folder", Path.home())))
         self.current_folder = previous if previous.is_dir() else Path.home()
         self.folder_tabs = [Path(str(item)) for item in self.settings.get("tabs", [str(self.current_folder)]) if Path(str(item)).is_dir()]
@@ -467,16 +486,17 @@ class FileWorkbench(tk.Tk):
         self.path_by_item: dict[str, Path] = {}
         self.preview_jobs: queue.Queue[tuple[int, str, object]] = queue.Queue()
         self.preview_lock = threading.Lock()
-        self.preview_request: tuple[Path, int] | None = None
+        self.preview_request: tuple[object, int] | None = None
         self.preview_worker_running = False
         self.preview_token = 0
         self.previewed_path: Path | None = None
         self.preview_pdf_path: Path | None = None
+        self.zip_preview_path: Path | None = None
         self.native_preview_process: subprocess.Popen[bytes] | None = None
         self.native_preview_path: Path | None = None
         self.pdf_zoom_generation = 0
         self.inline_markdown_path: Path | None = None
-        self.preview_font_size = 14
+        self.preview_font_size = 16
         self.markdown_zoom = 1.0
         self.folder_history = [self.current_folder]
         self.folder_history_index = 0
@@ -522,7 +542,7 @@ class FileWorkbench(tk.Tk):
         self.file_icons = {
             "folder": make_file_icon("#f4b942", folder=True), "doc": make_file_icon("#2b6cb0"),
             "xls": make_file_icon("#2f855a"), "ppt": make_file_icon("#dd6b20"), "pdf": make_file_icon("#c53030"),
-            "md": make_file_icon("#805ad5"), "file": make_file_icon("#718096"),
+            "md": make_file_icon("#805ad5"), "msg": make_file_icon("#0e7490"), "img": make_file_icon("#16a34a"), "zip": make_file_icon("#b45309"), "file": make_file_icon("#718096"),
         }
         tab_outer = ttk.Frame(self, padding=(12, 8, 12, 0))
         tab_outer.pack(fill=X)
@@ -610,7 +630,7 @@ class FileWorkbench(tk.Tk):
         self.preview = tk.Text(self.preview_host, wrap="word", font=("Microsoft YaHei", self.preview_font_size), padx=18, pady=16, state="disabled")
         self.preview_canvas = tk.Canvas(self.preview_host, highlightthickness=0, background="white")
         self.native_preview_host = tk.Frame(self.preview_host, background="white", highlightthickness=0)
-        self.markdown_view = HtmlFrame(self.preview_host, messages_enabled=False, vertical_scrollbar=True, horizontal_scrollbar=False, stylesheets_enabled=True)
+        self.markdown_view = HtmlFrame(self.preview_host, messages_enabled=False, vertical_scrollbar=True, horizontal_scrollbar=False, stylesheets_enabled=True, on_link_click=self.handle_preview_link)
         self.excel_stack = ttk.Frame(self.preview_host)
         self.excel_content = ttk.Frame(self.excel_stack)
         self.excel_content.pack(fill=BOTH, expand=True)
@@ -858,6 +878,12 @@ class FileWorkbench(tk.Tk):
             return self.file_icons["pdf"]
         if suffix == ".md":
             return self.file_icons["md"]
+        if suffix in MSG_EXTENSIONS:
+            return self.file_icons["msg"]
+        if suffix in IMAGE_EXTENSIONS:
+            return self.file_icons["img"]
+        if suffix in ZIP_EXTENSIONS:
+            return self.file_icons["zip"]
         return self.file_icons["file"]
 
     def refresh_file_list(self) -> None:
@@ -1152,6 +1178,28 @@ class FileWorkbench(tk.Tk):
             messagebox.showerror("Rename failed", str(exc))
         return "break"
 
+    def move_file_selection(self, delta: int) -> str:
+        """Move the file-list selection by one row and keep previewing.
+
+        This is safe to call no matter which widget currently has focus, so
+        Up/Down keep switching files even while the preview pane is active.
+        """
+        items = self.file_list.get_children()
+        if not items:
+            return "break"
+        selection = self.file_list.selection()
+        current = selection[0] if selection else None
+        if current in items:
+            index = items.index(current)
+        else:
+            index = 0 if delta > 0 else len(items) - 1
+        index = max(0, min(len(items) - 1, index + delta))
+        item = items[index]
+        self.file_list.selection_set(item)
+        self.file_list.focus(item)
+        self.file_list.see(item)
+        return "break"
+
     def file_list_arrow(self, event: object) -> str | None:
         if self.file_list.selection():
             return None
@@ -1166,12 +1214,15 @@ class FileWorkbench(tk.Tk):
 
     def route_file_list_arrow(self, event: tk.Event) -> str | None:
         focused = self.focus_get()
-        if focused in (self.file_list, self.folder_tree):
-            return None
         if focused is not None and focused.winfo_class() in {"Entry", "Text", "TEntry", "TCombobox", "Listbox"}:
             return None
+        if focused in (self.file_list, self.folder_tree):
+            return None  # The Treeview class binding already moves the selection.
+        # Focus sits in a preview widget (Markdown/Excel/native PDF): still move
+        # the file selection so arrows keep switching files while previewing.
+        delta = 1 if getattr(event, "keysym", "") == "Down" else -1
         self.file_list.focus_set()
-        return self.file_list_arrow(event)
+        return self.move_file_selection(delta)
 
     def route_paste_files(self, _event: tk.Event) -> str | None:
         focused = self.focus_get()
@@ -1189,6 +1240,7 @@ class FileWorkbench(tk.Tk):
             return
         self.inline_markdown_path = None
         self.save_markdown_button.pack_forget()
+        self.zip_preview_path = None
         if path.is_dir():
             self.stop_native_pdf_preview()
             self.previewed_path = None
@@ -1206,6 +1258,9 @@ class FileWorkbench(tk.Tk):
         )
         self.preview_title.set(path.name)
         self.preview_text("Loading local preview...")
+        # Keep keyboard focus on the file list so Up/Down keep switching files
+        # even while the preview pane is rendering.
+        self.after_idle(self.file_list.focus_set)
         if path.suffix.lower() == ".pdf" and NATIVE_PDF_PREVIEW.exists():
             self.after(20, lambda selected=path, selected_token=token: self.start_native_pdf_preview(selected, selected_token))
             return
@@ -1304,45 +1359,165 @@ class FileWorkbench(tk.Tk):
         with self.preview_lock:
             return self.preview_request is None and token == self.preview_token
 
-    def build_preview(self, path: Path, token: int) -> None:
+    def build_preview(self, path: Path | tuple[Path, int], token: int, display_name: str | None = None) -> None:
         try:
-            details = f"{path.name}\n{human_size(path.stat().st_size)}\n{path.parent}\n\n"
-            if path.suffix.lower() == ".md":
+            if isinstance(path, tuple):
+                zip_path, entry_index = path
+                self.build_zip_entry_preview(zip_path, entry_index, token)
+                return
+            suffix = path.suffix.lower()
+            details = f"{display_name or path.name}\n{human_size(path.stat().st_size)}\n{path.parent}\n\n"
+            if suffix == ".md":
                 self.preview_jobs.put((token, "markdown", path.read_text(encoding="utf-8", errors="replace")))
                 return
-            if path.suffix.lower() == ".pdf":
+            if suffix in MSG_EXTENSIONS:
+                self.preview_jobs.put((token, "text", details + MsgReader(path).preview_text()))
+                return
+            if suffix in ZIP_EXTENSIONS:
+                self.preview_jobs.put((token, "zip", (path, self.zip_archive_entries(path))))
+                return
+            if suffix in IMAGE_EXTENSIONS:
+                try:
+                    self.preview_jobs.put((token, "image", Image.open(path).copy()))
+                except (OSError, ValueError):
+                    self.preview_jobs.put((token, "text", details + "Image preview unavailable."))
+                return
+            if suffix == ".pdf":
                 self.preview_jobs.put((token, "image", render_pdf_first_page(path)))
                 if not self.preview_is_current(token):
                     return
                 self.preview_jobs.put((token, "image", render_pdf_pages(path)))
                 return
-            if path.suffix.lower() in {".xlsx", ".xlsm"}:
-                self.preview_jobs.put((token, "excel", excel_workbook_grid(path)))
+            if suffix in {".xlsx", ".xlsm"}:
+                # Instant text overview first; upgrade to the editable grid after.
+                self.preview_jobs.put((token, "text", details + office_text(path)))
+                if not self.preview_is_current(token):
+                    return
+                try:
+                    grid = excel_workbook_grid(path)
+                except Exception:
+                    grid = None
+                if grid is not None:
+                    self.preview_jobs.put((token, "excel", grid))
                 return
-            if path.suffix.lower() in {".doc", ".docx", ".ppt", ".pptx"}:
+            if suffix in {".doc", ".docx", ".ppt", ".pptx"}:
+                # Show an embedded thumbnail (or quick text) immediately, then
+                # render the full Office PDF preview in the background.
                 thumbnail = embedded_office_thumbnail(path)
                 if thumbnail is not None:
                     self.preview_jobs.put((token, "image", thumbnail))
+                else:
+                    self.preview_jobs.put((token, "text", details + office_text(path)))
                 if not self.preview_is_current(token):
                     return
                 try:
                     rendered = render_office_first_page(path)
                 except Exception:
-                    rendered = None  # Fall back to the plain text preview below.
+                    rendered = None  # Keep whatever quick preview already appeared.
                 if rendered is not None:
                     self.preview_jobs.put((token, "image", rendered))
                 rendered_pdf = cached_path(path, ".pdf")
                 if rendered_pdf.exists():
                     self.preview_jobs.put((token, "native_pdf", rendered_pdf))
-                    return
-            thumbnail = embedded_office_thumbnail(path) if path.suffix.lower() in OFFICE_EXTENSIONS else None
-            if thumbnail is not None:
-                self.preview_jobs.put((token, "image", thumbnail))
                 return
             content = text_preview(path)
         except Exception as exc:  # Keep the UI responsive if a malformed document appears.
             content = f"Preview unavailable: {exc}"
         self.preview_jobs.put((token, "text", details + content))
+
+    def zip_archive_entries(self, path: Path) -> str:
+        path = Path(path)
+        """Render a clickable HTML listing of the archive contents."""
+        try:
+            with zipfile.ZipFile(path) as archive:
+                infos = sorted(archive.infolist(), key=lambda info: (info.is_dir(), info.filename.lower()))
+        except (OSError, zipfile.BadZipFile) as exc:
+            return f"<p>Cannot read zip archive: {escape(str(exc))}</p>"
+        rows: list[str] = []
+        for index, info in enumerate(infos[:600]):
+            name = info.filename
+            is_dir = info.is_dir()
+            display = escape(name.rstrip("/") if is_dir else name)
+            icon = "&#128193;" if is_dir else "&#128196;"
+            size = "" if is_dir else escape(human_size(info.file_size))
+            rows.append(
+                "<a class='row' href='zip:%d'><span class='icon'>%s</span>"
+                "<span class='name'>%s</span><span class='size'>%s</span></a>"
+                % (index, icon, display, size)
+            )
+        if len(infos) > 600:
+            rows.append("<p class='hint'>... plus %d more item(s)</p>" % (len(infos) - 600))
+        css = (
+            "<style>"
+            "body{font-family:'Microsoft YaHei','Segoe UI',sans-serif;font-size:15px;background:#ffffff;color:#171717;margin:0;padding:14px 18px 40px;}"
+            "p.hint{color:#64748b;font-size:13px;margin:4px 0 12px;}"
+            "a.row{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:6px;text-decoration:none;color:#171717;}"
+            "a.row:hover{background:#eff6ff;}"
+            "span.icon{width:22px;text-align:center;}"
+            "span.name{flex:1;word-break:break-all;}"
+            "span.size{color:#64748b;font-size:13px;white-space:nowrap;}"
+            "</style>"
+        )
+        header = "<p class='hint'>Zip archive: %s &middot; %d item(s) &middot; click a file to preview it</p>" % (
+            escape(path.name), len(infos))
+        return "<!doctype html><html><head><meta charset='utf-8'>" + css + "</head><body>" + header + "".join(rows) + "</body></html>"
+
+    def build_zip_entry_preview(self, zip_path: Path, entry_index: int, token: int) -> None:
+        with zipfile.ZipFile(zip_path) as archive:
+            infos = archive.infolist()
+            if not (0 <= entry_index < len(infos)):
+                return
+            info = infos[entry_index]
+            if info.is_dir():
+                self.preview_jobs.put((token, "zip", (zip_path, self.zip_archive_entries(zip_path))))
+                return
+            name = info.filename
+            data = archive.read(info)
+        suffix = Path(name).suffix.lower()
+        tmp = PREVIEW_CACHE / ("zip-" + hashlib.sha1(("%s|%s" % (zip_path, name)).encode("utf-8")).hexdigest()[:20] + suffix)
+        try:
+            tmp.write_bytes(data)
+        except OSError:
+            tmp = None
+        if tmp is not None:
+            self.build_preview(tmp, token, display_name=name)
+            return
+        content = name + "\n" + human_size(len(data)) + "\n\n"
+        if suffix in PREVIEWABLE_TEXT or suffix in MSG_EXTENSIONS:
+            self.preview_jobs.put((token, "text", content + "Preview unavailable for this entry."))
+        else:
+            self.preview_jobs.put((token, "text", content + "Preview unavailable for entries of this type inside a zip."))
+
+    def preview_zip_listing(self, zip_path: Path, html: str) -> None:
+        self.zip_preview_path = zip_path
+        self.preview_title.set("%s | Zip contents" % zip_path.name)
+        self.preview.pack_forget()
+        self.native_preview_host.pack_forget()
+        self.preview_canvas.pack_forget()
+        self.excel_stack.pack_forget()
+        self.preview_scroll.pack_forget()
+        self.markdown_view.configure(zoom=self.markdown_zoom)
+        self.markdown_view.load_html(html)
+        self.markdown_view.pack(fill=BOTH, expand=True)
+
+    def handle_preview_link(self, url: str) -> None:
+        if self.zip_preview_path is None or not url.startswith("zip:"):
+            return
+        try:
+            index = int(url[4:])
+        except ValueError:
+            return
+        self.preview_token += 1
+        token = self.preview_token
+        self.previewed_path = self.zip_preview_path
+        self.preview_pdf_path = None
+        self.preview_title.set(self.zip_preview_path.name)
+        self.preview_text("Loading archive entry...")
+        with self.preview_lock:
+            self.preview_request = ((self.zip_preview_path, index), token)
+            if not self.preview_worker_running:
+                self.preview_worker_running = True
+                threading.Thread(target=self.preview_worker, daemon=True).start()
 
     def poll_preview(self) -> None:
         try:
@@ -1362,6 +1537,9 @@ class FileWorkbench(tk.Tk):
                         self.preview_markdown(str(content))
                     elif kind == "native_pdf":
                         self.start_native_pdf_preview(Path(str(content)), token)
+                    elif kind == "zip":
+                        zip_path, html = content
+                        self.preview_zip_listing(Path(zip_path), str(html))
                     else:
                         self.preview_text(str(content))
         except queue.Empty:
@@ -1675,4 +1853,23 @@ class FileWorkbench(tk.Tk):
 if __name__ == "__main__":
     if os.name == "nt":
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("jg.FileWorkbench")
+    if os.environ.get("FILE_WORKBENCH_SELFTEST"):
+        import traceback
+        log_path = BASE_DIR / "selftest.log"
+        try:
+            from msg_reader import MsgReader  # noqa: F401  (must be bundled next to the app)
+            missing = [str(path) for path in (OFFICE_RENDER_SCRIPT, EXCEL_EDIT_SCRIPT,
+                                              APP_ICON_PATH, NATIVE_PDF_PREVIEW) if not path.exists()]
+            if missing:
+                log_path.write_text("SELFTEST MISSING: " + "; ".join(missing), encoding="utf-8")
+                sys.exit(1)
+            app = FileWorkbench()
+            app.withdraw()
+            app.update_idletasks()
+            app.destroy()
+            log_path.write_text("SELFTEST OK", encoding="utf-8")
+            sys.exit(0)
+        except Exception:
+            log_path.write_text(traceback.format_exc(), encoding="utf-8")
+            sys.exit(1)
     FileWorkbench().mainloop()
