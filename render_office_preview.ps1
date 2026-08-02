@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory = $true)][string]$Source,
     [Parameter(Mandatory = $true)][string]$Output,
     [Parameter(Mandatory = $true)][ValidateSet('word', 'powerpoint')][string]$Kind
@@ -32,6 +32,23 @@ if (-not $normalisedTemp) { throw 'No usable TEMP folder found for Office render
 $env:TEMP = $normalisedTemp
 $env:TMP = $normalisedTemp
 
+# Files downloaded from the internet carry a Zone.Identifier (Mark-of-the-Web)
+# that makes Word open them in Protected View and fail COM automation with a
+# misleading "file appears to be corrupted" error.  Open a temp copy instead,
+# which is always treated as a local file.  The copy is removed afterwards.
+$workSource = $Source
+$tempCopy = $null
+try {
+    $zone = Get-Content -LiteralPath ($Source + ':Zone.Identifier') -ErrorAction SilentlyContinue
+    if ($zone -match 'ZoneId\s*=\s*[1-7]') {
+        $tempCopy = Join-Path $normalisedTemp ('fw-src-' + [guid]::NewGuid().ToString('N') + [System.IO.Path]::GetExtension($Source))
+        Copy-Item -LiteralPath $Source -Destination $tempCopy -Force
+        $workSource = $tempCopy
+    }
+} catch {
+    $workSource = $Source
+}
+
 $application = $null
 $document = $null
 try {
@@ -39,19 +56,17 @@ try {
         $application = New-Object -ComObject Word.Application
         $application.Visible = $false
         $application.DisplayAlerts = 0
-        $document = $application.Documents.Open($Source, $false, $true)
+        # ReadOnly + skip the recent-files list so a background preview leaves
+        # no trace and never shows a window.
+        $document = $application.Documents.Open($workSource, $false, $true, $false)
         $document.ExportAsFixedFormat($Output, 17)
     }
     else {
         $application = New-Object -ComObject PowerPoint.Application
-        $application.Visible = $false
-        # Prefer a window-less open so no PowerPoint window flashes during a
-        # background preview; fall back to WithWindow on hosts that refuse it.
-        try {
-            $document = $application.Presentations.Open($Source, $true, $false, $false)
-        } catch {
-            $document = $application.Presentations.Open($Source, $true, $false, $true)
-        }
+        # Never touch Visible: PS 5.1 cannot bind MsoTriState and hiding an
+        # already window-less app raises "Invalid request".  Opening with
+        # WithWindow=$false keeps every slide window hidden.
+        $document = $application.Presentations.Open($workSource, $true, $false, $false)
         # ExportAsFixedFormat is unreliable through PowerShell COM binding;
         # SaveAs with ppSaveAsPDF (32) produces the same native PDF.
         $document.SaveAs($Output, 32)
@@ -63,4 +78,5 @@ try {
 finally {
     if ($document) { try { $document.Close($false) } catch { try { $document.Close() } catch {} } }
     if ($application) { try { $application.Quit() } catch {} }
+    if ($tempCopy) { try { Remove-Item -LiteralPath $tempCopy -Force -ErrorAction SilentlyContinue } catch {} }
 }

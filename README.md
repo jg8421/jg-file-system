@@ -2,6 +2,13 @@
 
 Windows local file workbench for navigating folders, previewing Office documents, searching project files, and managing common file operations.
 
+## v1.4 Highlights
+
+- **Unstuck arrow navigation:** the native PDF preview no longer steals keyboard focus (non-activating host + focus guard), so Up/Down keep switching files even while a PDF is on screen.
+- **Two-stage Word/PPT preview:** selecting an Office file instantly shows a light preview (embedded thumbnail, extracted text, or cached first pages); press **ALT** to export the full readable PDF quietly in the background.
+- **Export progress feedback:** an in-app progress bar shows "正在导出中" while Office exports - no terminal, no Word/PowerPoint window, nothing steals your focus.
+- **More robust silent export:** window-less PowerPoint open (no WithWindow fallback), fixed PowerShell 5.1 MsoTriState binding, a Mark-of-the-Web (downloaded file) temp-copy workaround, and automatic cleanup of leftover hidden Office processes.
+
 ## v1.3 Highlights
 
 - **Explorer-style copy:** Ctrl+C puts the selected files on the Windows clipboard (CF_HDROP), so multi-selected files can be pasted straight into WeChat, mail clients, Explorer and other apps. The file list now supports Ctrl+click multi-select, and Ctrl+C works even while the preview pane has focus.
@@ -28,5 +35,5 @@ Windows local file workbench for navigating folders, previewing Office documents
 
 ## Run
 
-- **Release EXE:** open `release\FileWorkbench v1.3\FileWorkbench.exe` — portable, no Python needed.
+- **Release EXE:** open `release\FileWorkbench v1.4\FileWorkbench.exe` — portable, no Python needed.
 - **From source:** open `Launch File Workbench.cmd` on Windows with Python 3.12 and Microsoft Office installed for Office rendering and Excel cell editing.

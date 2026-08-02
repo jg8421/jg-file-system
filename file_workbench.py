@@ -69,6 +69,8 @@ NATIVE_PDF_PREVIEW = BUNDLE_DIR / "native_pdf_preview.exe"
 # large, so reopening a long document stays fast after its first render.
 MAX_PREVIEW_PAGES = 16
 PREVIEW_RASTER_SCALE = 2.0
+OFFICE_QUICK_SCALE = 1.2
+OFFICE_QUICK_PAGES = 2
 PREVIEW_CACHE_LIMIT = 5 * 1024 * 1024 * 1024
 PREVIEW_CACHE_TARGET = 4 * 1024 * 1024 * 1024
 PV_WORKING_ROOT = Path.home() / "Documents"
@@ -349,28 +351,30 @@ def cleanup_preview_cache() -> None:
             break
 
 
-def render_office_first_page(path: Path) -> Image.Image | None:
+def ensure_office_pdf(path: Path) -> Path:
+    """Export a Word/PowerPoint file to a cached PDF (worker thread only).
+
+    Returns the cached PDF path.  A leftover partial/corrupt render is
+    removed so a broken export is never served as a valid preview.
+    """
     suffix = path.suffix.lower()
-    if suffix in {".doc", ".docx", ".ppt", ".pptx"}:
-        rendered_pdf = cached_path(path, ".pdf")
-        if rendered_pdf.exists():
-            # A leftover partial/corrupt render would poison the preview cache.
+    rendered_pdf = cached_path(path, ".pdf")
+    if rendered_pdf.exists():
+        try:
+            with fitz.open(rendered_pdf) as document:
+                if document.page_count < 1:
+                    raise ValueError("empty PDF")
+            return rendered_pdf
+        except Exception:
             try:
-                with fitz.open(rendered_pdf) as document:
-                    if document.page_count < 1:
-                        raise ValueError("empty PDF")
-            except Exception:
-                try:
-                    rendered_pdf.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        if not rendered_pdf.exists():
-            kind = "word" if suffix in {".doc", ".docx"} else "powerpoint"
-            run_office_renderer(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(OFFICE_RENDER_SCRIPT), "-Source", str(path), "-Output", str(rendered_pdf), "-Kind", kind],
-            )
-        return render_pdf_pages(rendered_pdf)
-    return None
+                rendered_pdf.unlink(missing_ok=True)
+            except OSError:
+                pass
+    kind = "word" if suffix in {".doc", ".docx"} else "powerpoint"
+    run_office_renderer(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", str(OFFICE_RENDER_SCRIPT), "-Source", str(path), "-Output", str(rendered_pdf), "-Kind", kind],
+    )
+    return rendered_pdf
 
 
 def run_office_renderer(command: list[str]) -> None:
@@ -380,6 +384,9 @@ def run_office_renderer(command: list[str]) -> None:
     before = office_process_ids()
     try:
         subprocess.run(command, **options)
+        # Sweep up hidden Word/PowerPoint instances left behind after a
+        # successful export so the machine stays clean.
+        kill_new_office_processes(before)
     except Exception:
         # Remove the partial output PDF so a broken render is never served as valid.
         for argument in command:
@@ -495,6 +502,7 @@ class FileWorkbench(tk.Tk):
         self.preview_request: tuple[object, int] | None = None
         self.preview_worker_running = False
         self.preview_token = 0
+        self.office_preview_job: str | None = None
         self.previewed_path: Path | None = None
         self.preview_pdf_path: Path | None = None
         self.zip_preview_path: Path | None = None
@@ -526,6 +534,9 @@ class FileWorkbench(tk.Tk):
         self.bind_all("<Down>", self.route_file_list_arrow, add="+")
         self.bind_all("<Control-c>", self.route_copy, add="+")
         self.bind_all("<Control-v>", self.route_paste_files, add="+")
+        self.bind_all("<Alt_L>", self.request_office_full_preview, add="+")
+        self.bind_all("<Alt_R>", self.request_office_full_preview, add="+")
+        self.after(300, self.guard_preview_focus)
         self.load_folder(self.current_folder)
         self.refresh_folder_tabs()
         self.after(120, self.poll_preview)
@@ -631,6 +642,8 @@ class FileWorkbench(tk.Tk):
         preview_bar.pack(fill=X)
         self.preview_title = tk.StringVar(value="Preview")
         ttk.Label(preview_bar, textvariable=self.preview_title, font=("Segoe UI", 11, "bold")).pack(side=LEFT)
+        self.export_label = ttk.Label(preview_bar, text="正在导出中…", foreground="#2563eb")
+        self.export_progress = ttk.Progressbar(preview_bar, mode="indeterminate", length=140)
         ttk.Button(preview_bar, text="Open", command=self.open_selected).pack(side=RIGHT)
         ttk.Button(preview_bar, text="Edit", command=self.edit_selected).pack(side=RIGHT, padx=(0, 6))
         self.save_markdown_button = ttk.Button(preview_bar, text="Save", command=self.save_inline_markdown)
@@ -1343,6 +1356,24 @@ class FileWorkbench(tk.Tk):
             return None
         return self.paste_files()
 
+    def guard_preview_focus(self) -> None:
+        """Keep the keyboard out of the native PDF child window.
+
+        The WebView2 host is a separate native window, so Tk never sees arrow
+        keys while it has focus.  When it steals focus, pull it back to the
+        file list - but only while our own app (or the native preview host)
+        is the foreground window.
+        """
+        process = self.native_preview_process
+        if process is not None and process.poll() is None:
+            if self.focus_get() is None and self.focus_displayof() is None:
+                foreground = ctypes.windll.user32.GetForegroundWindow()
+                owner_pid = wintypes.DWORD()
+                ctypes.windll.user32.GetWindowThreadProcessId(foreground, ctypes.byref(owner_pid))
+                if owner_pid.value in (os.getpid(), process.pid):
+                    self.file_list.focus_set()
+        self.after(300, self.guard_preview_focus)
+
     def enter_selected(self, _event: object = None) -> str:
         self.open_selected()
         return "break"
@@ -1468,6 +1499,55 @@ class FileWorkbench(tk.Tk):
                 token = request[1]
                 self.preview_jobs.put((token, "text", f"Preview unavailable: {exc}"))
 
+    def request_office_full_preview(self, _event: object = None) -> str:
+        """ALT: upgrade the current Word/PowerPoint quick preview to a full PDF."""
+        path = self.selected_path()
+        if not path or path.suffix.lower() not in {".doc", ".docx", ".ppt", ".pptx"}:
+            return "break"
+        # Debounce so Alt+arrow navigation does not export files the user is
+        # only passing through; the selection is re-checked when it fires.
+        if self.office_preview_job is not None:
+            try:
+                self.after_cancel(self.office_preview_job)
+            except tk.TclError:
+                pass
+        self.office_preview_job = self.after(250, lambda selected=path: self.run_office_full_preview(selected))
+        return "break"
+
+    def run_office_full_preview(self, path: Path) -> None:
+        self.office_preview_job = None
+        if path != self.selected_path() or not path.is_file():
+            return
+        rendered_pdf = cached_path(path, ".pdf")
+        if not rendered_pdf.exists():
+            self.show_export_progress()
+            threading.Thread(target=self.export_office_pdf, args=(path, self.preview_token), daemon=True).start()
+            return
+        self.preview_jobs.put((self.preview_token, "native_pdf", str(rendered_pdf)))
+
+    def export_office_pdf(self, path: Path, token: int) -> None:
+        try:
+            ensure_office_pdf(path)
+        except Exception as exc:
+            self.preview_jobs.put((token, "export_done", None))
+            self.preview_jobs.put((token, "text", f"Office 导出失败：{exc}\n\n可改用 Open 直接打开原文件。"))
+            return
+        self.preview_jobs.put((token, "export_done", None))
+        if self.preview_is_current(token):
+            rendered_pdf = cached_path(path, ".pdf")
+            if rendered_pdf.exists():
+                self.preview_jobs.put((token, "native_pdf", str(rendered_pdf)))
+
+    def show_export_progress(self) -> None:
+        self.export_label.pack(side=LEFT, padx=(10, 4))
+        self.export_progress.pack(side=LEFT)
+        self.export_progress.start(12)
+
+    def hide_export_progress(self) -> None:
+        self.export_progress.stop()
+        self.export_progress.pack_forget()
+        self.export_label.pack_forget()
+
     def preview_is_current(self, token: int) -> bool:
         with self.preview_lock:
             return self.preview_request is None and token == self.preview_token
@@ -1514,24 +1594,28 @@ class FileWorkbench(tk.Tk):
                     self.preview_jobs.put((token, "excel", grid))
                 return
             if suffix in {".doc", ".docx", ".ppt", ".pptx"}:
-                # Show an embedded thumbnail (or quick text) immediately, then
-                # render the full Office PDF preview in the background.
+                # Two-stage preview: show the embedded thumbnail or extracted
+                # text instantly (plus cached first pages when a PDF already
+                # exists).  The heavy Office export only runs when the user
+                # presses ALT, so arrow navigation stays instant.
                 thumbnail = embedded_office_thumbnail(path)
                 if thumbnail is not None:
                     self.preview_jobs.put((token, "image", thumbnail))
                 else:
-                    self.preview_jobs.put((token, "text", details + office_text(path)))
+                    quick = office_text(path)
+                    if suffix in {".doc", ".ppt"}:
+                        quick = "(旧版二进制格式，无法免 Office 提取正文)\n\n按 ALT 键可导出完整 PDF 预览。"
+                    self.preview_jobs.put((token, "text", details + quick))
                 if not self.preview_is_current(token):
                     return
-                try:
-                    rendered = render_office_first_page(path)
-                except Exception:
-                    rendered = None  # Keep whatever quick preview already appeared.
-                if rendered is not None:
-                    self.preview_jobs.put((token, "image", rendered))
                 rendered_pdf = cached_path(path, ".pdf")
                 if rendered_pdf.exists():
-                    self.preview_jobs.put((token, "native_pdf", rendered_pdf))
+                    try:
+                        quick_pages = render_pdf_pages(rendered_pdf, scale=OFFICE_QUICK_SCALE, page_limit=OFFICE_QUICK_PAGES)
+                    except Exception:
+                        quick_pages = None
+                    if quick_pages is not None and self.preview_is_current(token):
+                        self.preview_jobs.put((token, "image", quick_pages))
                 return
             content = text_preview(path)
         except Exception as exc:  # Keep the UI responsive if a malformed document appears.
@@ -1636,6 +1720,9 @@ class FileWorkbench(tk.Tk):
         try:
             while True:
                 token, kind, content = self.preview_jobs.get_nowait()
+                if kind == "export_done":
+                    self.hide_export_progress()
+                    continue
                 if token == self.preview_token:
                     if kind == "image":
                         if self.preview_pdf_path is None or self.preview_zoom == 1.0:
