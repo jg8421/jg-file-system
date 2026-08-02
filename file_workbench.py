@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import zipfile
+import struct
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, X, Y, filedialog, messagebox, simpledialog, ttk
@@ -56,6 +57,9 @@ else:
     BUNDLE_DIR = BASE_DIR
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = BASE_DIR / "settings.json"
+AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE = "FileWorkbench"
+
 PREVIEW_CACHE = BASE_DIR / "preview_cache"
 OFFICE_RENDER_SCRIPT = BUNDLE_DIR / "render_office_preview.ps1"
 EXCEL_EDIT_SCRIPT = BUNDLE_DIR / "edit_excel_cell.ps1"
@@ -520,6 +524,7 @@ class FileWorkbench(tk.Tk):
         self.bind_all("<Alt-Up>", self.navigate_up)
         self.bind_all("<Up>", self.route_file_list_arrow, add="+")
         self.bind_all("<Down>", self.route_file_list_arrow, add="+")
+        self.bind_all("<Control-c>", self.route_copy, add="+")
         self.bind_all("<Control-v>", self.route_paste_files, add="+")
         self.load_folder(self.current_folder)
         self.refresh_folder_tabs()
@@ -557,6 +562,8 @@ class FileWorkbench(tk.Tk):
         ttk.Button(top, text="Open folder", command=self.choose_folder).pack(side=LEFT)
         ttk.Button(top, text="Up", command=self.go_up).pack(side=LEFT, padx=(6, 0))
         ttk.Button(top, text="Pin current folder", command=self.pin_current_folder).pack(side=LEFT, padx=(6, 0))
+        self.auto_start_var = tk.BooleanVar(value=self.is_auto_start())
+        ttk.Checkbutton(top, text="开机自启动", variable=self.auto_start_var, command=self.toggle_auto_start).pack(side=LEFT, padx=(10, 0))
         self.path_var = tk.StringVar()
         entry = ttk.Entry(top, textvariable=self.path_var)
         entry.pack(side=LEFT, fill=X, expand=True, padx=8)
@@ -595,7 +602,7 @@ class FileWorkbench(tk.Tk):
 
         center = ttk.Frame(self.body, width=570)
         columns = ("type", "modified", "size")
-        self.file_list = ttk.Treeview(center, columns=columns, show=("tree", "headings"), selectmode="browse")
+        self.file_list = ttk.Treeview(center, columns=columns, show=("tree", "headings"), selectmode="extended")
         self.file_list.heading("#0", text="Name", command=lambda: self.sort_by("name"))
         self.file_list.column("#0", width=310, anchor="w")
         headings = {"type": "Type", "modified": "Modified", "size": "Size"}
@@ -673,6 +680,51 @@ class FileWorkbench(tk.Tk):
             SETTINGS_PATH.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    # ---------- 开机自启动 ----------
+    def _autostart_command(self) -> str:
+        """返回写入注册表 Run 键的启动命令（跟随当前运行方式：正式版 exe 或开发版 pythonw）"""
+        if getattr(sys, "frozen", False):
+            exe = Path(sys.executable).resolve()
+            if exe.suffix.lower() == ".exe":
+                return f'"{exe}"'
+        py = Path(sys.executable).resolve()
+        pythonw = py.with_name("pythonw.exe")
+        if not pythonw.exists():
+            pythonw = py
+        return f'"{pythonw}" "{Path(__file__).resolve()}"'
+
+    def is_auto_start(self) -> bool:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY) as key:
+                value, _kind = winreg.QueryValueEx(key, AUTOSTART_VALUE)
+            return bool(value)
+        except OSError:
+            return False
+
+    def set_auto_start(self, enabled: bool) -> bool:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                if enabled:
+                    winreg.SetValueEx(key, AUTOSTART_VALUE, 0, winreg.REG_SZ, self._autostart_command())
+                else:
+                    try:
+                        winreg.DeleteValue(key, AUTOSTART_VALUE)
+                    except FileNotFoundError:
+                        pass
+            return True
+        except OSError as exc:
+            self.status.set(f"设置开机自启动失败：{exc}")
+            return False
+
+    def toggle_auto_start(self) -> None:
+        enabled = bool(self.auto_start_var.get())
+        if self.set_auto_start(enabled):
+            self.status.set("已开启开机自启动（下次开机自动运行 File Workbench）" if enabled else "已关闭开机自启动")
+        else:
+            self.auto_start_var.set(self.is_auto_start())
 
     def refresh_folder_tabs(self) -> None:
         for child in self.folder_tab_bar.winfo_children():
@@ -1079,12 +1131,65 @@ class FileWorkbench(tk.Tk):
     def selected_paths(self) -> list[Path]:
         return [self.path_by_item[item] for item in self.file_list.selection() if item in self.path_by_item]
 
+    def copy_files_to_clipboard(self, paths: list[Path]) -> None:
+        """Expose the selected files on the Windows clipboard (CF_HDROP), like Explorer.
+
+        This lets the selection be pasted into WeChat, mail clients, Explorer and
+        other apps exactly as if the files had been copied there.
+        """
+        if os.name != "nt" or not paths:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            # 64-bit handles must be declared or ctypes truncates them to 32-bit.
+            user32.OpenClipboard.argtypes = [wintypes.HWND]
+            user32.OpenClipboard.restype = ctypes.c_int
+            user32.EmptyClipboard.restype = ctypes.c_int
+            user32.SetClipboardData.argtypes = [ctypes.c_uint, wintypes.HANDLE]
+            user32.SetClipboardData.restype = wintypes.HANDLE
+            user32.CloseClipboard.restype = ctypes.c_int
+            kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+            kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+            CF_HDROP = 15
+            files = "\0".join(str(path) for path in paths) + "\0\0"
+            payload = files.encode("utf-16-le")
+            total = 20 + len(payload)
+            buffer = ctypes.create_string_buffer(total)
+            buffer[0:4] = struct.pack("<I", 20)           # DROPFILES.pFiles
+            buffer[16:20] = struct.pack("<I", 1)           # DROPFILES.fWide = 1
+            buffer[20:20 + len(payload)] = payload
+            if not user32.OpenClipboard(None):
+                return
+            try:
+                user32.EmptyClipboard()
+                handle = kernel32.GlobalAlloc(0x0042, total)  # GMEM_MOVEABLE | GMEM_ZEROINIT
+                if not handle:
+                    return
+                locked = kernel32.GlobalLock(handle)
+                if not locked:
+                    kernel32.GlobalFree(handle)
+                    return
+                ctypes.memmove(ctypes.c_void_p(locked), buffer, total)
+                kernel32.GlobalUnlock(handle)
+                if not user32.SetClipboardData(CF_HDROP, handle):
+                    kernel32.GlobalFree(handle)
+            finally:
+                user32.CloseClipboard()
+        except Exception:
+            pass
+
     def copy_selected_files(self) -> str:
         paths = self.selected_paths()
         if paths:
             self.file_clipboard = paths
             self.file_clipboard_mode = "copy"
-            self.status.set(f"Copied {len(paths)} item(s). Choose a folder and press Ctrl+V.")
+            self.copy_files_to_clipboard(paths)
+            self.status.set(f"Copied {len(paths)} item(s) to the clipboard. Ctrl+V pastes here or in any other app.")
         return "break"
 
     def cut_selected_files(self) -> str:
@@ -1225,6 +1330,12 @@ class FileWorkbench(tk.Tk):
         delta = 1 if getattr(event, "keysym", "") == "Down" else -1
         self.file_list.focus_set()
         return self.move_file_selection(delta)
+
+    def route_copy(self, _event: tk.Event) -> str | None:
+        focused = self.focus_get()
+        if focused is not None and focused.winfo_class() in {"Entry", "Text", "TEntry", "TCombobox"}:
+            return None
+        return self.copy_selected_files()
 
     def route_paste_files(self, _event: tk.Event) -> str | None:
         focused = self.focus_get()

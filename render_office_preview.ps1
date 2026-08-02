@@ -44,9 +44,14 @@ try {
     }
     else {
         $application = New-Object -ComObject PowerPoint.Application
-        # WithWindow must be $true: some PowerPoint builds fail to open files
-        # when asked to open them completely window-less.
-        $document = $application.Presentations.Open($Source, $true, $false, $true)
+        $application.Visible = $false
+        # Prefer a window-less open so no PowerPoint window flashes during a
+        # background preview; fall back to WithWindow on hosts that refuse it.
+        try {
+            $document = $application.Presentations.Open($Source, $true, $false, $false)
+        } catch {
+            $document = $application.Presentations.Open($Source, $true, $false, $true)
+        }
         # ExportAsFixedFormat is unreliable through PowerShell COM binding;
         # SaveAs with ppSaveAsPDF (32) produces the same native PDF.
         $document.SaveAs($Output, 32)
