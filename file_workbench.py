@@ -46,13 +46,15 @@ MAX_SEARCH_CACHE_ENTRIES = 400
 MAX_SEARCH_FILES = 20_000
 MAX_TEXT = 250_000
 if getattr(sys, "frozen", False):
-    # User data (settings/cache) lives next to the EXE; bundled helpers live in
-    # the _internal bundle directory that PyInstaller exposes via sys._MEIPASS.
-    BASE_DIR = Path(sys.executable).resolve().parent
-    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR)).resolve()
+    # User data (settings/cache) lives in %APPDATA%\FileWorkbench so the release
+    # folder stays clean and portable; bundled helpers live in the _internal
+    # bundle directory that PyInstaller exposes via sys._MEIPASS.
+    BASE_DIR = Path(os.environ.get("APPDATA") or str(Path.home())) / "FileWorkbench"
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)).resolve()
 else:
     BASE_DIR = Path(__file__).resolve().parent
     BUNDLE_DIR = BASE_DIR
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = BASE_DIR / "settings.json"
 PREVIEW_CACHE = BASE_DIR / "preview_cache"
 OFFICE_RENDER_SCRIPT = BUNDLE_DIR / "render_office_preview.ps1"
@@ -65,7 +67,7 @@ MAX_PREVIEW_PAGES = 16
 PREVIEW_RASTER_SCALE = 2.0
 PREVIEW_CACHE_LIMIT = 5 * 1024 * 1024 * 1024
 PREVIEW_CACHE_TARGET = 4 * 1024 * 1024 * 1024
-PV_WORKING_ROOT = Path.home() / "Documents" / "【PV Working】"
+PV_WORKING_ROOT = Path.home() / "Documents"
 
 
 def enable_high_dpi() -> None:

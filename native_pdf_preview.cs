@@ -5,6 +5,7 @@ using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
 internal sealed class NativePdfPreview : Form
@@ -41,7 +42,11 @@ internal sealed class NativePdfPreview : Form
                 ResizeToParent();
                 resizeTimer.Tick += (s, e) => ResizeToParent();
                 resizeTimer.Start();
-                await browser.EnsureCoreWebView2Async(null);
+                string userDataFolder = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "FileWorkbench", "WebView2");
+                var webViewEnvironment = await CoreWebView2Environment.CreateAsync(null, userDataFolder, null);
+                await browser.EnsureCoreWebView2Async(webViewEnvironment);
                 browser.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
                 browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
                 NavigateTo(documentPath);
