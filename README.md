@@ -2,6 +2,12 @@
 
 Windows local file workbench for navigating folders, previewing Office documents, searching project files, and managing common file operations.
 
+## v1.3 Highlights
+
+- **Explorer-style copy:** Ctrl+C puts the selected files on the Windows clipboard (CF_HDROP), so multi-selected files can be pasted straight into WeChat, mail clients, Explorer and other apps. The file list now supports Ctrl+click multi-select, and Ctrl+C works even while the preview pane has focus.
+- **Silent Office preview:** PowerPoint/Word previews render fully in the background — no application window flashes, no terminal pop-ups; the pane just shows "Loading".
+- **Privacy hardening:** settings, preview cache and WebView2 data now live in `%APPDATA%\FileWorkbench`, keeping the release folder clean and safe to share.
+
 ## v1.2 Highlights
 
 - **MSG email preview:** open Outlook `.msg` files directly — subject, sender, recipients, attachments, and body text are extracted locally (no Outlook needed).
@@ -22,5 +28,5 @@ Windows local file workbench for navigating folders, previewing Office documents
 
 ## Run
 
-- **Release EXE:** open `release\FileWorkbench v1.2\FileWorkbench.exe` — portable, no Python needed.
+- **Release EXE:** open `release\FileWorkbench v1.3\FileWorkbench.exe` — portable, no Python needed.
 - **From source:** open `Launch File Workbench.cmd` on Windows with Python 3.12 and Microsoft Office installed for Office rendering and Excel cell editing.
